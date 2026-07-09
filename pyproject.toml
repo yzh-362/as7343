@@ -1,0 +1,11 @@
+[project]
+name = "as7343"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.1",
+]
+[tool.uv]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"

@@ -1,92 +1,126 @@
 import time
-from machine import I2C
+from machine import Pin, I2C
+import neopixel
+from as7343 import AS7343
 
-class AS7343:
-    def __init__(self, i2c, address=0x39):
-        """
-        初始化AS7343光谱传感器驱动类
-        :param i2c: 已经初始化的machine.I2C对象
-        :param address: 传感器固定I2C七位地址，默认为0x39
-        """
-        self.i2c = i2c
-        self.address = address
+# 1. 物理外设初始化
+pixel_pin = Pin(16, Pin.OUT)
+rgb_led = neopixel.NeoPixel(pixel_pin, 1)
 
-    def write_register(self, reg, value):
-        """向指定的8位寄存器地址写入单字节数据"""
-        self.i2c.writeto_mem(self.address, reg, bytes([value]))
+def set_rgb_led(r, g, b):
+    rgb_led[0] = (r, g, b)
+    rgb_led.write()
 
-    def read_register(self, reg):
-        """从指定的8位寄存器地址读取单字节数据"""
-        return self.i2c.readfrom_mem(self.address, reg, 1)[0]
+i2c_bus = I2C(0, sda=Pin(0), scl=Pin(1), freq=400000)
+sensor = AS7343(i2c_bus)
 
-    def init_sensor(self):
-        """
-        按照芯片状态机要求，分步初始化配置AS7343传感器并开启18通道全扫描模式
-        """
-        self.write_register(0x80, 0x01)
-        time.sleep_ms(2)
+# 2. 定义存储文件名
+matrix_file = "reconstruction_matrix.csv"
+raw_data_file = "raw_data.csv"
+recon_data_file = "reconstructed_spectrum.csv"
 
-        self.write_register(0x81, 29)
-        self.write_register(0xD4, 599 & 0xFF)
-        self.write_register(0xD5, (599 >> 8) & 0xFF)
+# 3. 动态解析本地重建矩阵
+reconstruction_matrix = []
+matrix_channels = []
+wavelengths = []
 
-        self.write_register(0xD6, 0x60)
-        self.write_register(0xC6, 0x07)
-        self.write_register(0x80, 0x03)
-
-    def is_data_ready(self):
-        """
-        检查当前周期的光谱转换是否已全量完成
-        :return: 布尔值，True表示数据就绪可读
-        """
-        status2 = self.read_register(0x90)
-        return (status2 & 0x40) != 0
-
-    def read_all_channels(self):
-        """
-        利用I2C地址指针自增机制，批量读取36字节并解析全部通道数据
-        :return: 包含各个通道实际ADC计数值的字典
-        """
-        data = self.i2c.readfrom_mem(self.address, 0x95, 36)
-        raw_values = []
-        for i in range(18):
-            low_byte = data[i * 2]
-            high_byte = data[i * 2 + 1]
-            raw_values.append((high_byte << 8) | low_byte)
+print("正在从物理文件系统读取重建矩阵...")
+try:
+    with open(matrix_file, "r") as f:
+        # 读取第一行表头
+        header = f.readline().strip().split(",")
+        matrix_channels = header[1:]  # 提取对齐的通道名称顺序
         
-        spectral_data = {
-            "FZ": raw_values[0],
-            "FY": raw_values[1],
-            "FXL": raw_values[2],
-            "NIR": raw_values[3],
-            "F2": raw_values[6],
-            "F3": raw_values[7],
-            "F4": raw_values[8],
-            "F6": raw_values[9],
-            "F1": raw_values[12],
-            "F7": raw_values[13],
-            "F8": raw_values[14],
-            "F5": raw_values[15],
-            "VIS": raw_values[4],
-            "FD": raw_values[5]
-        }
-        return spectral_data
+        # 逐行解析波长与对应加权系数
+        for line in f:
+            parts = line.strip().split(",")
+            if parts and len(parts) > 1:
+                wavelengths.append(int(parts[0]))
+                row_weights = [float(x) for x in parts[1:]]
+                reconstruction_matrix.append(row_weights)
+    print("重建矩阵配置成功加载，共计", len(wavelengths), "个波长节点。")
+except Exception as e:
+    print("矩阵加载异常，请确认 reconstruction_matrix.csv 已正确上载到根目录:", e)
 
-    def control_onboard_led(self, enable, current_ma=12):
-        """
-        控制AS7343传感器上自带的照明LED（通过LDR引脚恒流源驱动）
-        :param enable: True开启LED，False关闭LED
-        :param current_ma: 恒流驱动电流大小，单位mA（范围4mA至258mA，步进2mA）
-        """
-        if not enable:
-            self.write_register(0xCD, 0x00)
-            return
+# 4. 初始化创建输出 CSV 数据表格与表头
+print("正在初始化 CSV 存储结构...")
+with open(raw_data_file, "w") as f_raw:
+    f_raw.write("Index,Timestamp_ms,F1,F2,FZ,F3,F4,FY,F5,FXL,F6,F7,F8,NIR,VIS,FD\n")
 
-        if current_ma < 4:
-            current_ma = 4
-        elif current_ma > 258:
-            current_ma = 258
+with open(recon_data_file, "w") as f_recon:
+    # 动态生成包含具体纳米波长单位的 CSV 表头
+    recon_header = "Index,Timestamp_ms," + ",".join([str(w) + "nm" for w in wavelengths]) + "\n"
+    f_recon.write(recon_header)
 
-        code = (current_ma - 4) // 2
-        reg_value = 0x80 | (code & 0x7F)
-        self.write_register(0xCD, reg_value)
+# 全局运行变量
+led_toggle_state = False
+sample_index = 0
+
+try:
+    # 5. 传感器核心状态机激活
+    sensor.init_sensor()
+    sensor.control_onboard_led(enable=True, current_ma=20)
+    print("系统初始化闭环构建完成，进入实时采集与重构流...")
+
+    while True:
+        # 板载状态指示灯动态翻转
+        if led_toggle_state:
+            set_rgb_led(0, 40, 0)
+        else:
+            set_rgb_led(0, 0, 0)
+        led_toggle_state = not led_toggle_state
+
+        # 检查光谱传感器数据是否转换就绪
+        if sensor.is_data_ready():
+            spectrum = sensor.read_all_channels()
+            sample_index += 1
+            current_time = time.ticks_ms()
+
+            # A. 组装并追加存储原始通道数据
+            raw_row = "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n".format(
+                sample_index, current_time,
+                spectrum["F1"], spectrum["F2"], spectrum["FZ"], spectrum["F3"],
+                spectrum["F4"], spectrum["FY"], spectrum["F5"], spectrum["FXL"],
+                spectrum["F6"], spectrum["F7"], spectrum["F8"], spectrum["NIR"],
+                spectrum["VIS"], spectrum["FD"]
+            )
+            with open(raw_data_file, "a") as f_raw:
+                f_raw.write(raw_row)
+
+            # B. 执行实时光谱重建计算 (一维矩阵点乘与非负物理截断)
+            # 严格按照从 CSV 读取到的通道顺序提取当前传感器的归一化数值值值
+            X_input = [float(spectrum[ch]) for ch in matrix_channels]
+            reconstructed_spectrum = []
+            
+            for row_weights in reconstruction_matrix:
+                intensity = 0.0
+                for j in range(len(X_input)):
+                    intensity += row_weights[j] * X_input[j]
+                # 物理非负约束
+                if intensity < 0.0:
+                    intensity = 0.0
+                reconstructed_spectrum.append(intensity)
+
+            # C. 组装并追加存储101维连续光谱数据
+            recon_str_list = [f"{val:.4f}" for val in reconstructed_spectrum]
+            recon_row = "{},{},{}\n".format(sample_index, current_time, ",".join(recon_str_list))
+            with open(recon_data_file, "a") as f_recon:
+                f_recon.write(recon_row)
+
+            # D. 命令行终端调试输出
+            print("========================================")
+            print(f"样本序号: {sample_index} | 物理系统时间: {current_time} ms")
+            print(f"原始特征值[FZ]: {spectrum['FZ']} | [FY]: {spectrum['FY']} | [NIR]: {spectrum['NIR']}")
+            print(f"重建光谱端点 [380nm]: {reconstructed_spectrum[0]:.2f} | [880nm]: {reconstructed_spectrum[-1]:.2f}")
+            print(f"状态: 数据成功同步写入至 {raw_data_file} 与 {recon_data_file}")
+
+        time.sleep_ms(500)
+
+except Exception as error:
+    print("运行时触发未知系统异常:", error)
+
+finally:
+    print("\n检测到系统退出指令，开始释放硬件控制权...")
+    sensor.control_onboard_led(enable=False)
+    set_rgb_led(0, 0, 0)
+    print("所有物理 LED 光源已安全关闭，文件已妥善保存于局部闪存。")
